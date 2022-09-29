@@ -4,3 +4,4 @@ from .vae import *
 from .lm import *
 # from .plotter import *
 from .utils import *
+from .fvae import *

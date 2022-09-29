@@ -1,4 +1,6 @@
 import math
+import pdb
+
 import torch
 import torch.nn as nn
 
@@ -54,7 +56,7 @@ class GaussianEncoderBase(nn.Module):
 
         KL = 0.5 * (mu.pow(2) + logvar.exp() - logvar - 1).sum(dim=1)
 
-        return z, KL
+        return z, KL, mu, logvar
 
     def reparameterize(self, mu, logvar, nsamples=1):
         """sample from posterior Gaussian family

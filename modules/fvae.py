@@ -1,4 +1,6 @@
 import math
+import pdb
+
 import torch
 import torch.nn as nn
 
@@ -6,12 +8,13 @@ from .utils import log_sum_exp
 from .lm import LSTM_LM
 
 
-class VAE(nn.Module):
+class FVAE(nn.Module):
     """VAE with normal prior"""
-    def __init__(self, encoder, decoder, args):
-        super(VAE, self).__init__()
+    def __init__(self, encoder, decoder, sec_encoder, args):
+        super(FVAE, self).__init__()
         self.encoder = encoder
         self.decoder = decoder
+        self.sec_encoder = sec_encoder
 
         self.args = args
 
@@ -38,6 +41,23 @@ class VAE(nn.Module):
         """
 
         return self.encoder(x)
+
+    def sec_encode(self, x, nsamples=1):
+        """
+                Returns: Tensor1, Tensor2
+                    Tensor1: the tensor latent z with shape [batch, nsamples, nz]
+                    Tensor2: the tenor of KL for each x with shape [batch]
+                """
+        return self.sec_encoder.encode(x, nsamples)
+
+    def sec_encode_stats(self, x):
+        """
+                Returns: Tensor1, Tensor2
+                    Tensor1: the mean of latent z with shape [batch, nz]
+                    Tensor2: the logvar of latent z with shape [batch, nz]
+                """
+
+        return self.sec_encoder(x)
 
     def decode(self, z, strategy, K=5):
         """generate samples from z given strategy
@@ -75,6 +95,30 @@ class VAE(nn.Module):
 
         return self.decode(z, decoding_strategy, K)
 
+    def generate_from_prior(self, x, z):
+        '''
+        x, sents_len = x
+
+        # remove end symbol
+        src = x[:, :-1]
+
+        # remove start symbol
+        tgt = x[:, 1:]
+
+        batch_size, seq_len = src.size()
+        n_sample = z.size(1)
+        '''
+
+        # (batch_size * n_sample, seq_len, vocab_size)
+        return self.decoder.decode(x, z)
+
+    def sample_from_prior(self, nsamples):
+        """sampling from prior distribution
+
+        Returns: Tensor
+            Tensor: samples from prior with shape (nsamples, nz)
+        """
+        return self.prior.sample((nsamples,))
 
     def loss(self, x, kl_weight, nsamples=1):
         """
@@ -89,13 +133,44 @@ class VAE(nn.Module):
             Tensor3: KL loss shape [batch]
         """
 
-        z, KL = self.encode(x, nsamples)
-
+        z, KL, mu_r, logvar_r = self.encode(x, nsamples)
         # (batch)
         reconstruct_err = self.decoder.reconstruct_error(x, z).mean(dim=1)
 
+        z_prior = self.sample_from_prior(len(x))
+        z_prior = z_prior.unsqueeze(-1)
+        # noise = torch.randn(self.batch_size, 1, self.latent_dim, device='cuda')
 
-        return reconstruct_err + kl_weight * KL, reconstruct_err, KL
+        generated_data = self.generate_from_prior(x, z_prior)
+        generated_data = torch.as_tensor(generated_data)
+        generated_data = torch.argmax(nn.functional.softmax(generated_data), dim=2)
+
+        z_g, _, mu_g, logvar_g = self.sec_encode(generated_data, nsamples)
+
+        KL_real_gene = self.compute_kl_bet_real_and_generated(mu_r, logvar_r, mu_g, logvar_g)
+
+
+        return reconstruct_err + kl_weight * KL + KL_real_gene, reconstruct_err, KL, KL_real_gene
+
+    def compute_kl_bet_real_and_generated(self, mu_r, logvar_r, mu_g, logvar_g):
+        # define mu
+
+        mean_r = mu_r.mean(-2, True)
+        mean_g = mu_g.mean(-2, True)
+
+        mean_channel_sq_avg_r = mu_r.pow(2).mean(-2, True)
+        mean_channel_sq_avg_g = mu_g.pow(2).mean(-2, True)
+
+        var_r_hat = logvar_r.exp().mean(-2, True)
+        var_g_hat = logvar_g.exp().mean(-2, True)
+
+        var_r_hat = mean_channel_sq_avg_r + var_r_hat - mean_r.pow(2)
+        var_g_hat = mean_channel_sq_avg_g + var_g_hat - mean_g.pow(2)
+
+        kld = (0.5 * (((mean_r - mean_g).pow(2) + var_r_hat).div(
+            var_g_hat) - var_r_hat.log() + var_g_hat.log() - 1)).mean(1, True)
+
+        return kld
 
     def nll_iw(self, x, nsamples, ns=100):
         """compute the importance weighting estimate of the log-likelihood
@@ -129,7 +204,7 @@ class VAE(nn.Module):
         return -ll_iw
 
     def KL(self, x):
-        _, KL = self.encode(x, 1)
+        _, KL, _, _ = self.encode(x, 1)
 
         return KL
 
@@ -194,14 +269,6 @@ class VAE(nn.Module):
         log_posterior = log_comp - log_sum_exp(log_comp, dim=1, keepdim=True)
 
         return log_posterior
-
-    def sample_from_prior(self, nsamples):
-        """sampling from prior distribution
-
-        Returns: Tensor
-            Tensor: samples from prior with shape (nsamples, nz)
-        """
-        return self.prior.sample((nsamples,))
 
 
     def sample_from_inference(self, x, nsamples=1):

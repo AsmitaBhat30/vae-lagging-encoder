@@ -12,8 +12,8 @@ from torch import nn, optim
 
 from data import MonoTextData
 
-from modules import LSTMEncoder, LSTMDecoder
-from modules import VAE
+from modules import LSTMEncoder, LSTMDecoder, LSTMEncoder_feedback
+from modules import FVAE
 from modules import generate_grid
 
 clip_grad = 5.0
@@ -75,7 +75,7 @@ def init_config():
         args.num_plot = 50
 
     save_dir = "models/%s" % args.dataset
-    plot_dir = "plot_data/%s" % args.plot_mode
+    plot_dir = "plot_data/%s/fvae/" % args.plot_mode
 
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
@@ -110,7 +110,7 @@ def init_config():
 
 def test(model, test_data_batch, mode, args):
 
-    report_kl_loss = report_rec_loss = 0
+    report_kl_loss = report_rec_loss = report_kl_real_gene_loss = 0
     report_num_words = report_num_sents = 0
     for i in np.random.permutation(len(test_data_batch)):
         batch_data = test_data_batch[i]
@@ -122,31 +122,35 @@ def test(model, test_data_batch, mode, args):
         report_num_sents += batch_size
 
 
-        loss, loss_rc, loss_kl = model.loss(batch_data, 1.0, nsamples=args.nsamples)
+        loss, loss_rc, loss_kl, loss_kl_real_generated = model.loss(batch_data, 1.0, nsamples=args.nsamples)
 
         assert(not loss_rc.requires_grad)
 
         loss_rc = loss_rc.sum()
         loss_kl = loss_kl.sum()
+        loss_kl_real_generated = loss_kl_real_generated.sum()
 
 
         report_rec_loss += loss_rc.item()
         report_kl_loss += loss_kl.item()
+        report_kl_real_gene_loss += loss_kl_real_generated.item()
 
     mutual_info = calc_mi(model, test_data_batch)
 
-    test_loss = (report_rec_loss  + report_kl_loss) / report_num_sents
+    test_loss = (report_rec_loss  + report_kl_loss + report_kl_real_gene_loss) / report_num_sents
 
     nll = (report_kl_loss + report_rec_loss) / report_num_sents
     kl = report_kl_loss / report_num_sents
     ppl = np.exp(nll * report_num_sents / report_num_words)
+    kl_new = report_kl_real_gene_loss / report_num_sents
 
-    print('%s --- avg_loss: %.4f, kl: %.4f, mi: %.4f, recon: %.4f, nll: %.4f, ppl: %.4f' % \
-           (mode, test_loss, report_kl_loss / report_num_sents, mutual_info,
+    print('%s --- avg_loss: %.4f, kl: %.4f, kl_new: %.4f, mi: %.4f, recon: %.4f, nll: %.4f, ppl: %.4f' % \
+           (mode, test_loss, report_kl_loss / report_num_sents,
+            report_kl_real_gene_loss / report_num_sents, mutual_info,
             report_rec_loss / report_num_sents, nll, ppl))
     sys.stdout.flush()
 
-    return test_loss, nll, kl, ppl
+    return test_loss, nll, kl, ppl, kl_new
 
 def calc_iwnll(model, test_data_batch, args):
 
@@ -218,7 +222,6 @@ def plot_multiple(model, plot_data, grid_z,
     pickle.dump(save_data, open(save_path, 'wb'))
 
 def plot_single(infer_mean, posterior_mean, args):
-
     # [batch, time]
     infer_mean = torch.cat(infer_mean, 1)
     posterior_mean = torch.cat(posterior_mean, 1)
@@ -278,15 +281,19 @@ def main(args):
 
     decoder = LSTMDecoder(args, vocab, model_init, emb_init)
 
-    vae = VAE(encoder, decoder, args).to(device)
+    sec_encoder = LSTMEncoder_feedback(args, vocab_size, model_init, emb_init)
+
+    vae = FVAE(encoder, decoder, sec_encoder, args).to(device)
 
 
     if args.optim == 'sgd':
         enc_optimizer = optim.SGD(vae.encoder.parameters(), lr=1.0)
+        sec_enc_optimizer = optim.SGD(vae.sec_encoder.parameters(), lr=1.0)
         dec_optimizer = optim.SGD(vae.decoder.parameters(), lr=1.0)
         opt_dict['lr'] = 1.0
     else:
         enc_optimizer = optim.Adam(vae.encoder.parameters(), lr=0.001, betas=(0.9, 0.999))
+        sec_enc_optimizer = optim.Adam(vae.sec_encoder.parameters(), lr=0.001, betas=(0.9, 0.999))
         dec_optimizer = optim.Adam(vae.decoder.parameters(), lr=0.001, betas=(0.9, 0.999))
         opt_dict['lr'] = 0.001
 
@@ -330,6 +337,7 @@ def main(args):
 
     for epoch in range(args.epochs):
         report_kl_loss = report_rec_loss = 0
+        report_kl_real_gen_loss = 0
         report_num_words = report_num_sents = 0
         for i in np.random.permutation(len(train_data_batch)):
             if args.plot_mode == "single":
@@ -356,11 +364,12 @@ def main(args):
 
                 enc_optimizer.zero_grad()
                 dec_optimizer.zero_grad()
+                sec_enc_optimizer.zero_grad()
 
                 burn_batch_size, burn_sents_len = batch_data_enc.size()
                 burn_num_words += (burn_sents_len - 1) * burn_batch_size
 
-                loss, loss_rc, loss_kl = vae.loss(batch_data_enc, kl_weight, nsamples=args.nsamples)
+                loss, loss_rc, loss_kl, loss_kl_r_and_g = vae.loss(batch_data_enc, kl_weight, nsamples=args.nsamples)
 
                 burn_cur_loss += loss.sum().item()
                 loss = loss.mean(dim=-1)
@@ -398,9 +407,10 @@ def main(args):
 
             enc_optimizer.zero_grad()
             dec_optimizer.zero_grad()
+            sec_enc_optimizer.zero_grad()
 
 
-            loss, loss_rc, loss_kl = vae.loss(batch_data, kl_weight, nsamples=args.nsamples)
+            loss, loss_rc, loss_kl, loss_kl_r_and_g = vae.loss(batch_data, kl_weight, nsamples=args.nsamples)
 
             loss = loss.mean(dim=-1)
 
@@ -409,10 +419,12 @@ def main(args):
 
             loss_rc = loss_rc.sum()
             loss_kl = loss_kl.sum()
+            loss_kl_r_and_g = loss_kl_r_and_g.sum()
 
             if not aggressive_flag:
                 enc_optimizer.step()
 
+            sec_enc_optimizer.step()
             dec_optimizer.step()
             if args.plot_mode == 'single' and epoch == 0:
                 vae.eval()
@@ -427,27 +439,28 @@ def main(args):
 
             report_rec_loss += loss_rc.item()
             report_kl_loss += loss_kl.item()
+            report_kl_real_gen_loss += loss_kl_r_and_g.item()
 
             if iter_ % log_niter == 0:
-                train_loss = (report_rec_loss  + report_kl_loss) / report_num_sents
+                train_loss = (report_rec_loss  + report_kl_loss + report_kl_real_gen_loss) / report_num_sents
                 if aggressive_flag or epoch == 0:
                     vae.eval()
                     mi = calc_mi(vae, val_data_batch)
                     vae.train()
 
                     print('epoch: %d, iter: %d, avg_loss: %.4f, kl: %.4f, mi: %.4f, recon: %.4f,' \
-                           'time elapsed %.2fs' %
+                           'kl_real_gen: %.4f, time elapsed %.2fs' %
                            (epoch, iter_, train_loss, report_kl_loss / report_num_sents, mi,
-                           report_rec_loss / report_num_sents, time.time() - start))
+                           report_rec_loss / report_num_sents, report_kl_real_gen_loss / report_num_sents, time.time() - start))
                 else:
                     print('epoch: %d, iter: %d, avg_loss: %.4f, kl: %.4f, recon: %.4f,' \
-                           'time elapsed %.2fs' %
+                           'kl_real_gen: %.4f, time elapsed %.2fs' %
                            (epoch, iter_, train_loss, report_kl_loss / report_num_sents,
-                           report_rec_loss / report_num_sents, time.time() - start))
+                           report_rec_loss / report_num_sents, report_kl_real_gen_loss / report_num_sents,time.time() - start))
 
                 sys.stdout.flush()
 
-                report_rec_loss = report_kl_loss = 0
+                report_rec_loss = report_kl_loss = report_kl_real_gen_loss = 0
                 report_num_words = report_num_sents = 0
 
             if iter_ % args.plot_niter == 0 and epoch == 0:
@@ -484,7 +497,7 @@ def main(args):
 
         vae.eval()
         with torch.no_grad():
-            loss, nll, kl, ppl = test(vae, val_data_batch, "VAL", args)
+            loss, nll, kl, ppl, kl_new = test(vae, val_data_batch, "VAL", args)
 
         if loss < best_loss:
             print('update best loss')
@@ -505,9 +518,11 @@ def main(args):
                 decay_cnt += 1
                 if args.optim == 'sgd':
                     enc_optimizer = optim.SGD(vae.encoder.parameters(), lr=opt_dict["lr"])
+                    sec_enc_optimizer = optim.SGD(vae.sec_encoder.parameters(), lr=opt_dict["lr"])
                     dec_optimizer = optim.SGD(vae.decoder.parameters(), lr=opt_dict["lr"])
                 else:
                     enc_optimizer = optim.Adam(vae.encoder.parameters(), lr=opt_dict["lr"], betas=(0.5, 0.999))
+                    sec_enc_optimizer = optim.Adam(vae.sec_encoder.parameters(), lr=opt_dict["lr"], betas=(0.5, 0.999))
                     dec_optimizer = optim.Adam(vae.decoder.parameters(), lr=opt_dict["lr"], betas=(0.5, 0.999))
         else:
             opt_dict["not_improved"] = 0
@@ -518,7 +533,7 @@ def main(args):
 
         if epoch % args.test_nepoch == 0:
             with torch.no_grad():
-                loss, nll, kl, ppl = test(vae, test_data_batch, "TEST", args)
+                loss, nll, kl, ppl, new_kl = test(vae, test_data_batch, "TEST", args)
 
         vae.train()
 
